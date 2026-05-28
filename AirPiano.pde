@@ -2,6 +2,10 @@
 // Processing info panel — receives JSON state from Python via TCP
 // Run this BEFORE running air_piano.py
 
+// AirPiano.pde
+// Processing info panel — receives JSON state from Python via TCP
+// Run this BEFORE running air_piano.py
+
 import processing.net.*;
 
 Server server;
@@ -9,8 +13,8 @@ String buf = "";
 
 // State from Python
 String chord     = "---";
-String effect    = "None";
-String gesture   = "major";
+String quality   = "major";
+String gesture   = "major";   // "major"/"minor" — drives the chord colour
 int    octave    = 4;
 boolean rightHand = false;
 boolean leftHand  = false;
@@ -46,7 +50,7 @@ void draw() {
   background(BG);
   drawHeader();
   drawChordBox();
-  drawEffectBox();
+  drawQualityBox();
   drawOctaveBox();
   drawHandBox();
   drawHints();
@@ -75,20 +79,29 @@ void readTCP() {
 
 void parseMsg(String msg) {
   try {
+    // Check if the message is actually a JSON object
+    if (!msg.startsWith("{") || !msg.endsWith("}")) return;
+    
     JSONObject j = parseJSONObject(msg);
     if (j == null) return;
+    
     String nc = j.getString("chord");
-    if (nc.length() > 0 && !nc.equals(lastChord)) {
+    // Only flash if the note actually changed
+    if (!nc.equals("---") && !nc.equals(lastChord)) {
       flashTimer = FLASH_DUR;
-      lastChord  = nc;
+      lastChord = nc;
     }
-    chord     = nc.replace("_", " ").toUpperCase();
-    effect    = j.getString("effect");
-    gesture   = j.getString("gesture");
-    octave    = j.getInt("octave");
+    
+    chord = nc.toUpperCase();
+    quality = j.getString("quality");
+    gesture = j.getString("gesture");
+    octave = j.getInt("octave");
+    leftHand = j.getBoolean("left_hand");
     rightHand = j.getBoolean("right_hand");
-    leftHand  = j.getBoolean("left_hand");
-  } catch (Exception e) {}
+    
+  } catch (Exception e) {
+    println("JSON Error: " + e.getMessage());
+  }
 }
 
 void drawHeader() {
@@ -102,15 +115,15 @@ void drawChordBox() {
   box(14, 60, width-28, 105);
   label("CHORD", width/2, 77);
   fill(gesture.equals("minor") ? MINOR_C : MAJOR_C);
-  textSize(50);
+  textSize(46);
   text(chord, width/2, 128);
 }
 
-void drawEffectBox() {
+void drawQualityBox() {
   box(14, 175, width-28, 68);
-  label("EFFECT", width/2, 192);
+  label("CHORD TYPE", width/2, 192);
   fill(CYAN); textSize(26);
-  text(effect.toUpperCase(), width/2, 224);
+  text(quality.toUpperCase(), width/2, 224);
 }
 
 void drawOctaveBox() {
@@ -140,7 +153,7 @@ void drawHandBox() {
   fill(leftHand ? CYAN : MUTED); textSize(11);
   text("LEFT", width/2-65, 408);
   fill(MUTED); textSize(9);
-  text("effects", width/2-65, 418);
+  text("note", width/2-65, 418);
 
   noStroke();
   fill(rightHand ? YELLOW : color(26, 30, 50));
@@ -148,20 +161,20 @@ void drawHandBox() {
   fill(rightHand ? YELLOW : MUTED); textSize(11);
   text("RIGHT", width/2+65, 408);
   fill(MUTED); textSize(9);
-  text("chords", width/2+65, 418);
+  text("chord type", width/2+65, 418);
 
   color gc = gesture.equals("minor") ? MINOR_C : MAJOR_C;
   fill(gc, 40); noStroke();
   rect(width/2-36, 378, 72, 24, 8);
   fill(gc); textSize(12);
-  text(gesture.toUpperCase(), width/2, 390);
+  text(quality.toUpperCase(), width/2, 390);
 }
 
 void drawHints() {
   fill(MUTED); textSize(10);
-  text("Left hand = effects wheel  |  Right hand = chord wheel", width/2, 448);
-  text("Point finger to select slice", width/2, 462);
-  text("Open palm = Major  |  Fist = Minor  |  Height = Octave", width/2, 476);
+  text("Left wheel = note  |  Right wheel = chord type", width/2, 448);
+  text("Point a finger to select a slice", width/2, 462);
+  text("Right-hand height = octave", width/2, 476);
 }
 
 void box(float x, float y, float w, float h) {
