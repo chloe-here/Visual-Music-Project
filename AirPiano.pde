@@ -1,225 +1,173 @@
 // AirPiano.pde
-// Processing display layer — receives JSON from Python via TCP
+// Processing info panel — receives JSON state from Python via TCP
+// Run this BEFORE running air_piano.py
 
 import processing.net.*;
-import java.util.ArrayList;
 
-// ── TCP ──────────────────────────────────────────────────────────────────────
 Server server;
-String buffer = "";
+String buf = "";
 
-// ── State ────────────────────────────────────────────────────────────────────
-String currentChord  = "";
-String currentGesture = "";
-int    activeZone    = -1;
-float[][] landmarks  = new float[21][2];
-boolean hasLandmarks = false;
+// State from Python
+String chord     = "---";
+String effect    = "None";
+String gesture   = "major";
+int    octave    = 4;
+boolean rightHand = false;
+boolean leftHand  = false;
 
-// Glow flash on trigger
-int   flashTimer     = 0;
-int   FLASH_DURATION = 18;  // frames
-
-// Note names for zone labels
-String[] NOTE_NAMES = {"C", "D", "E", "F", "G", "A", "B"};
+// Flash on new note
+int    flashTimer = 0;
+int    FLASH_DUR  = 20;
+String lastChord  = "";
 
 // Colors
-color BG_COLOR       = color(10, 10, 20);
-color ZONE_IDLE      = color(30, 40, 70);
-color ZONE_ACTIVE    = color(80, 130, 255);
-color GLOW_COLOR     = color(120, 180, 255);
-color SKELETON_COLOR = color(0, 220, 150);
-color TEXT_COLOR     = color(220, 230, 255);
-color MINOR_COLOR    = color(200, 80, 120);
+color BG      = color(8, 10, 20);
+color PANEL   = color(16, 20, 38);
+color YELLOW  = color(255, 220, 80);
+color CYAN    = color(80, 220, 255);
+color MAJOR_C = color(80, 210, 130);
+color MINOR_C = color(210, 80, 120);
+color MUTED   = color(70, 80, 108);
+color WHITE   = color(210, 215, 240);
+color OCT5    = color(255, 110, 70);
+color OCT4    = color(80, 130, 255);
+color OCT3    = color(80, 210, 120);
 
-// ── Landmark connections (MediaPipe hand skeleton) ───────────────────────────
-int[][] CONNECTIONS = {
-  {0,1},{1,2},{2,3},{3,4},       // thumb
-  {0,5},{5,6},{6,7},{7,8},       // index
-  {0,9},{9,10},{10,11},{11,12},  // middle
-  {0,13},{13,14},{14,15},{15,16},// ring
-  {0,17},{17,18},{18,19},{19,20} // pinky
-};
-
-// ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  size(800, 600);
+  size(380, 500);
   frameRate(30);
   textAlign(CENTER, CENTER);
   server = new Server(this, 5204);
   println("Processing TCP server listening on port 5204");
 }
 
-// ── Draw ─────────────────────────────────────────────────────────────────────
 void draw() {
   readTCP();
-  background(BG_COLOR);
-
-  drawKeyZones();
-  drawChordLabel();
-  drawSkeleton();
-  drawGestureLabel();
-  drawInstructions();
+  background(BG);
+  drawHeader();
+  drawChordBox();
+  drawEffectBox();
+  drawOctaveBox();
+  drawHandBox();
+  drawHints();
 
   if (flashTimer > 0) {
-    drawFlash();
+    noStroke();
+    fill(YELLOW, map(flashTimer, 0, FLASH_DUR, 0, 50));
+    rect(0, 0, width, height);
     flashTimer--;
   }
 }
 
-// ── TCP Read ─────────────────────────────────────────────────────────────────
 void readTCP() {
   Client c = server.available();
   if (c == null) return;
-
-  String incoming = c.readString();
-  if (incoming == null) return;
-
-  buffer += incoming;
-
-  // Process complete newline-terminated messages
-  while (buffer.contains("\n")) {
-    int idx = buffer.indexOf("\n");
-    String msg = buffer.substring(0, idx).trim();
-    buffer = buffer.substring(idx + 1);
-    if (msg.length() > 0) parseMessage(msg);
+  String s = c.readString();
+  if (s == null) return;
+  buf += s;
+  while (buf.contains("\n")) {
+    int i      = buf.indexOf("\n");
+    String msg = buf.substring(0, i).trim();
+    buf        = buf.substring(i + 1);
+    if (msg.length() > 0) parseMsg(msg);
   }
 }
 
-void parseMessage(String msg) {
+void parseMsg(String msg) {
   try {
-    JSONObject json = parseJSONObject(msg);
-    if (json == null) return;
-
-    String chord   = json.getString("chord");
-    int zone       = json.getInt("zone");
-    String gesture = json.getString("gesture");
-
-    // Detect new trigger for flash
-    if (!chord.equals(currentChord) && chord.length() > 0) {
-      flashTimer = FLASH_DURATION;
+    JSONObject j = parseJSONObject(msg);
+    if (j == null) return;
+    String nc = j.getString("chord");
+    if (nc.length() > 0 && !nc.equals(lastChord)) {
+      flashTimer = FLASH_DUR;
+      lastChord  = nc;
     }
-
-    currentChord   = chord;
-    activeZone     = zone;
-    currentGesture = gesture;
-
-    // Parse landmarks
-    JSONArray lmArray = json.getJSONArray("landmarks");
-    if (lmArray != null && lmArray.size() == 21) {
-      hasLandmarks = true;
-      for (int i = 0; i < 21; i++) {
-        JSONArray pt = lmArray.getJSONArray(i);
-        landmarks[i][0] = pt.getFloat(0) * width;
-        landmarks[i][1] = pt.getFloat(1) * height;
-      }
-    } else {
-      hasLandmarks = false;
-    }
-
-  } catch (Exception e) {
-    // Malformed message — skip
-  }
+    chord     = nc.replace("_", " ").toUpperCase();
+    effect    = j.getString("effect");
+    gesture   = j.getString("gesture");
+    octave    = j.getInt("octave");
+    rightHand = j.getBoolean("right_hand");
+    leftHand  = j.getBoolean("left_hand");
+  } catch (Exception e) {}
 }
 
-// ── Draw Key Zones ────────────────────────────────────────────────────────────
-void drawKeyZones() {
-  int numZones = 7;
-  float zoneW  = width / float(numZones);
-  float zoneH  = height * 0.55;
-  float zoneY  = height * 0.42;
+void drawHeader() {
+  fill(YELLOW); textSize(24);
+  text("AIR PIANO", width/2, 28);
+  fill(MUTED); textSize(11);
+  text("live info panel", width/2, 48);
+}
 
-  for (int i = 0; i < numZones; i++) {
-    float x = i * zoneW;
+void drawChordBox() {
+  box(14, 60, width-28, 105);
+  label("CHORD", width/2, 77);
+  fill(gesture.equals("minor") ? MINOR_C : MAJOR_C);
+  textSize(50);
+  text(chord, width/2, 128);
+}
 
-    if (i == activeZone) {
-      fill(ZONE_ACTIVE);
-      stroke(GLOW_COLOR);
-      strokeWeight(3);
-      rect(x + 4, zoneY, zoneW - 8, zoneH, 8);
+void drawEffectBox() {
+  box(14, 175, width-28, 68);
+  label("EFFECT", width/2, 192);
+  fill(CYAN); textSize(26);
+  text(effect.toUpperCase(), width/2, 224);
+}
 
-      noFill();
-      stroke(GLOW_COLOR, 80);
-      strokeWeight(10);
-      rect(x + 4, zoneY, zoneW - 8, zoneH, 8);
-    } else {
-      fill(ZONE_IDLE);
-      noStroke();
-      rect(x + 4, zoneY, zoneW - 8, zoneH, 8);
-    }
-
+void drawOctaveBox() {
+  box(14, 253, width-28, 80);
+  label("OCTAVE", width/2, 270);
+  int[]    octs  = {5, 4, 3};
+  color[]  cols  = {OCT5, OCT4, OCT3};
+  String[] names = {"HIGH", "MID", "LOW"};
+  for (int i = 0; i < 3; i++) {
+    float ox   = width/2 - 64 + i * 64;
+    boolean on = octs[i] == octave;
     noStroke();
-    fill(i == activeZone ? color(255) : color(120, 140, 200));
-    textSize(20);
-    text(NOTE_NAMES[i], x + zoneW / 2, zoneY + zoneH - 24);
+    fill(on ? cols[i] : color(26, 30, 50));
+    ellipse(ox, 308, on ? 26 : 18, on ? 26 : 18);
+    fill(on ? WHITE : MUTED); textSize(10);
+    text(names[i], ox, 326);
   }
 }
 
-// ── Chord Label ───────────────────────────────────────────────────────────────
-void drawChordLabel() {
-  if (currentChord.length() == 0) {
-    fill(60, 70, 100);
-    textSize(36);
-    text("Show your hand...", width / 2, height * 0.18);
-    return;
-  }
-
-  boolean isMinor = currentGesture.equals("minor");
-  color labelColor = isMinor ? MINOR_COLOR : GLOW_COLOR;
-
-  fill(labelColor);
-  textSize(64);
-  text(currentChord.replace("_", " ").toUpperCase(), width / 2, height * 0.15);
-
-  fill(TEXT_COLOR, 180);
-  textSize(20);
-  String gestureLabel = isMinor ? "Fist -> Minor" : "Open Palm -> Major";
-  text(gestureLabel, width / 2, height * 0.26);
-}
-
-// ── Hand Skeleton ─────────────────────────────────────────────────────────────
-void drawSkeleton() {
-  if (!hasLandmarks) return;
-
-  stroke(SKELETON_COLOR, 180);
-  strokeWeight(2);
-  for (int[] conn : CONNECTIONS) {
-    float x1 = landmarks[conn[0]][0];
-    float y1 = landmarks[conn[0]][1];
-    float x2 = landmarks[conn[1]][0];
-    float y2 = landmarks[conn[1]][1];
-    line(x1, y1, x2, y2);
-  }
+void drawHandBox() {
+  box(14, 343, width-28, 80);
+  label("HANDS", width/2, 360);
 
   noStroke();
-  for (int i = 0; i < 21; i++) {
-    boolean isTip = (i == 4 || i == 8 || i == 12 || i == 16 || i == 20);
-    float r = isTip ? 10 : 6;
-    fill(isTip ? GLOW_COLOR : SKELETON_COLOR);
-    ellipse(landmarks[i][0], landmarks[i][1], r, r);
-  }
-}
+  fill(leftHand ? CYAN : color(26, 30, 50));
+  ellipse(width/2 - 65, 390, 20, 20);
+  fill(leftHand ? CYAN : MUTED); textSize(11);
+  text("LEFT", width/2-65, 408);
+  fill(MUTED); textSize(9);
+  text("effects", width/2-65, 418);
 
-// ── Gesture Label ─────────────────────────────────────────────────────────────
-void drawGestureLabel() {
-  if (!hasLandmarks) return;
-  fill(TEXT_COLOR, 140);
-  textSize(15);
-  text("Active Zone: " + (activeZone >= 0 ? NOTE_NAMES[activeZone] : "-"),
-       width / 2, height * 0.96);
-}
-
-// ── Flash Effect ──────────────────────────────────────────────────────────────
-void drawFlash() {
-  float alpha = map(flashTimer, 0, FLASH_DURATION, 0, 60);
   noStroke();
-  fill(GLOW_COLOR, alpha);
-  rect(0, 0, width, height);
+  fill(rightHand ? YELLOW : color(26, 30, 50));
+  ellipse(width/2 + 65, 390, 20, 20);
+  fill(rightHand ? YELLOW : MUTED); textSize(11);
+  text("RIGHT", width/2+65, 408);
+  fill(MUTED); textSize(9);
+  text("chords", width/2+65, 418);
+
+  color gc = gesture.equals("minor") ? MINOR_C : MAJOR_C;
+  fill(gc, 40); noStroke();
+  rect(width/2-36, 378, 72, 24, 8);
+  fill(gc); textSize(12);
+  text(gesture.toUpperCase(), width/2, 390);
 }
 
-// ── Instructions ──────────────────────────────────────────────────────────────
-void drawInstructions() {
-  fill(TEXT_COLOR, 80);
-  textSize(13);
-  text("Move hand left/right to change note  |  Open palm = Major  |  Fist = Minor",
-       width / 2, height * 0.92);
+void drawHints() {
+  fill(MUTED); textSize(10);
+  text("Left hand = effects wheel  |  Right hand = chord wheel", width/2, 448);
+  text("Point finger to select slice", width/2, 462);
+  text("Open palm = Major  |  Fist = Minor  |  Height = Octave", width/2, 476);
+}
+
+void box(float x, float y, float w, float h) {
+  fill(PANEL); noStroke(); rect(x, y, w, h, 10);
+}
+
+void label(String t, float x, float y) {
+  fill(MUTED); textSize(11); text(t, x, y);
 }
