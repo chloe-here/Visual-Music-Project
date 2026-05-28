@@ -1,21 +1,22 @@
 # air_piano.py
 # cv2 imported first to avoid SDL conflict
-
+ 
 import cv2
 import numpy as np
 import os
+import math
 import socket
 import json
 import time
-import threading
 import subprocess
 import mediapipe as mp
-
+from PIL import Image, ImageDraw, ImageFont
+ 
 # ── TCP to Processing ─────────────────────────────────────────────────────────
 TCP_HOST = "localhost"
 TCP_PORT = 5204
 tcp_sock = None
-
+ 
 def connect_to_processing():
     global tcp_sock
     try:
@@ -27,7 +28,7 @@ def connect_to_processing():
     except Exception:
         print("Processing not running — continuing without it.")
         tcp_sock = None
-
+ 
 def send_state(data: dict):
     if tcp_sock is None:
         return
@@ -35,15 +36,77 @@ def send_state(data: dict):
         tcp_sock.sendall((json.dumps(data) + "\n").encode())
     except Exception:
         pass
-
-# ── Audio via afplay (Mac built-in, no SDL conflict) ──────────────────────────
-NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B"]
-EFFECTS    = ["None", "Echo", "Reverb", "High", "Low", "Chorus"]
-SAMPLE_DIR = os.getcwd()
-
-def wav_path(note, octave):
-    return os.path.join(SAMPLE_DIR, f"{note}_oct{octave}.wav")
-
+ 
+# ── Fonts (TrueType via Pillow) ───────────────────────────────────────────────
+FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Avenir Next.ttc",   # macOS
+    "/System/Library/Fonts/SFNSRounded.ttf",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       # Linux fallback
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
+FONT_PATH = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
+_font_cache = {}
+ 
+def _font(size):
+    size = int(size)
+    if size not in _font_cache:
+        try:
+            _font_cache[size] = ImageFont.truetype(FONT_PATH, size) if FONT_PATH else ImageFont.load_default()
+        except Exception:
+            _font_cache[size] = ImageFont.load_default()
+    return _font_cache[size]
+ 
+def text_w(txt, size):
+    return _font(size).getlength(txt)
+ 
+_text_queue = []
+ 
+def queue_text(x, y, txt, size, color_bgr, anchor="lm", shadow=False):
+    r, g, b = color_bgr[2], color_bgr[1], color_bgr[0]
+    _text_queue.append((int(x), int(y), txt, int(size), (r, g, b), anchor, shadow))
+ 
+def flush_text(frame):
+    if not _text_queue:
+        return frame
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    d   = ImageDraw.Draw(img)
+    for x, y, txt, size, color, anchor, shadow in _text_queue:
+        f = _font(size)
+        if shadow:
+            d.text((x + 1, y + 1), txt, font=f, fill=(0, 0, 0), anchor=anchor)
+        d.text((x, y), txt, font=f, fill=color, anchor=anchor)
+    _text_queue.clear()
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+ 
+# ── Notes & chord qualities ───────────────────────────────────────────────────
+NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B"]                       
+QUALITIES  = ["major", "maj7", "7", "sus4", "minor", "m7", "dim", "aug"]  
+ 
+QUALITY_LABELS = {
+    "major": "maj", "maj7": "maj7", "7": "7", "sus4": "sus4",
+    "minor": "m",   "m7":  "m7",   "dim": "dim", "aug":  "aug",
+}
+QUALITY_SUFFIX = {
+    "major": "", "minor": "m", "maj7": "maj7", "7": "7",
+    "sus4": "sus4", "m7": "m7", "dim": "dim", "aug": "aug",
+}
+MINOR_QUALITIES = {"minor", "m7", "dim"}
+ 
+CHORD_DIR = os.path.join(os.getcwd(), "chords")
+ 
+def chord_path(note, quality, octave):
+    return os.path.join(CHORD_DIR, f"{note}_{quality}_oct{octave}.wav")
+ 
+def chord_name(note, quality):
+    return note + QUALITY_SUFFIX[quality]
+ 
+def is_minor_quality(q):
+    return q in MINOR_QUALITIES
+ 
+# ── Audio via afplay ──────────────────────────────────────────────────────────
 def afplay(path, volume=1.0):
     if not os.path.exists(path):
         print(f"Missing: {path}")
@@ -53,299 +116,291 @@ def afplay(path, volume=1.0):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
+ 
+def play_chord(note, quality, octave):
+    afplay(chord_path(note, quality, octave), volume=1.0)
+ 
+# ── Geometry helpers & Math Fixes ──────────────────────────────────────────────
+# Tweak these if the physical finger doesn't perfectly match the visual slice
+NOTE_OFFSET = -25  
+QUAL_OFFSET = -22 
 
-def play_note(note, octave, effect):
-    path = wav_path(note, octave)
-    afplay(path, volume=1.0)
+# ── Audio via afplay ──────────────────────────────────────────────────────────
 
-    if effect == "Echo":
-        def _echo():
-            time.sleep(0.25); afplay(path, volume=0.45)
-            time.sleep(0.25); afplay(path, volume=0.22)
-        threading.Thread(target=_echo, daemon=True).start()
+current_audio_process = None 
 
-    elif effect == "Reverb":
-        def _reverb():
-            for delay, vol in [(0.07, 0.45), (0.14, 0.30), (0.22, 0.18), (0.32, 0.08)]:
-                time.sleep(delay); afplay(path, volume=vol)
-        threading.Thread(target=_reverb, daemon=True).start()
-
-    elif effect == "High":
-        hi = wav_path(note, min(octave + 1, 5))
-        threading.Thread(target=afplay, args=(hi, 0.5), daemon=True).start()
-
-    elif effect == "Low":
-        lo = wav_path(note, max(octave - 1, 3))
-        threading.Thread(target=afplay, args=(lo, 0.5), daemon=True).start()
-
-    elif effect == "Chorus":
-        def _chorus():
-            time.sleep(0.035); afplay(path, volume=0.55)
-            time.sleep(0.045); afplay(path, volume=0.35)
-        threading.Thread(target=_chorus, daemon=True).start()
-
-# ── MediaPipe ─────────────────────────────────────────────────────────────────
-mp_hands = mp.solutions.hands
-hands    = mp_hands.Hands(
-    max_num_hands=2,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.6,
-)
-
-# ── Gesture helpers ───────────────────────────────────────────────────────────
-def detect_gesture(lm):
-    up = sum([
-        lm[8].y  < lm[6].y,
-        lm[12].y < lm[10].y,
-        lm[16].y < lm[14].y,
-        lm[20].y < lm[18].y,
-    ])
-    return "major" if up >= 3 else "minor"
+def afplay(path, volume=1.0):
+    global current_audio_process  # Bring in the tracker
+    
+    if not os.path.exists(path):
+        print(f"Missing: {path}")
+        return
+        
+    # 1. If a chord is already playing, instantly stop it!
+    if current_audio_process is not None:
+        current_audio_process.terminate()
+        
+    # 2. Play the new chord and save this process to our variable
+    current_audio_process = subprocess.Popen(
+        ["afplay", "-v", str(volume), "-q", "1", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+ 
+def play_chord(note, quality, octave):
+    afplay(chord_path(note, quality, octave), volume=1.0)
 
 def get_octave(wrist_y_norm):
     if wrist_y_norm < 0.33:   return 5
     elif wrist_y_norm < 0.66: return 4
     else:                      return 3
-
-def index_angle(lm, fw, fh):
-    dx = (lm[8].x - lm[0].x) * fw
-    dy = (lm[8].y - lm[0].y) * fh
-    return np.degrees(np.arctan2(dy, dx)) % 360
-
-def angle_to_slice(angle, n):
-    return int(((angle + 90) % 360) / (360.0 / n)) % n
-
-# ── Trigger: only fires when finger moves into a NEW slice ────────────────────
-_last_slice = -1
-
-def should_trigger(slice_idx):
-    global _last_slice
-    if slice_idx == _last_slice:
-        return False
-    _last_slice = slice_idx
-    return True
-
-# ── Wheel colours (BGR) ───────────────────────────────────────────────────────
-CHORD_COLORS = [
-    (200,  90,  30),
-    ( 80, 160,  30),
-    (120,  30, 160),
-    ( 20, 140, 180),
-    (160, 140,  30),
-    ( 60,  60, 160),
-    (180,  30, 100),
+ 
+def angle_around(cx, cy, px, py):
+    return math.degrees(math.atan2(py - cy, px - cx)) % 360
+ 
+def angle_to_slice(angle, n, offset=0):
+    return int(((angle + 90 + offset) % 360) / (360.0 / n)) % n
+ 
+# ── Colours & UI Drawing ──────────────────────────────────────────────────────
+NOTE_COLORS = [
+    ( 90, 170, 230), ( 90, 200, 180), (120, 200, 120), (150, 200,  90),
+    (210, 180,  90), (220, 140,  90), (210, 110, 130),
 ]
-EFFECT_COLORS = [
-    ( 60,  60,  60),
-    (200, 100,  30),
-    (180,  30, 120),
-    ( 20, 100, 210),
-    (100, 180,  30),
-    ( 80,  30, 180),
+QUALITY_COLORS = [          
+    (205, 150,  80), (195, 160,  90), (185, 140,  95), (175, 130, 115),
+    (160, 100, 175), (165,  95, 160), (150,  90, 145), (180, 130, 100),
 ]
-
-# ── Draw wheel ────────────────────────────────────────────────────────────────
-def draw_wheel(frame, cx, cy, radius, labels, active, colors, triggered=False):
-    n    = len(labels)
+ 
+def _blend(frame, overlay, alpha, roi):
+    x, y, w, h = roi
+    x2, y2 = x + w, y + h
+    x,  y  = max(0, x),  max(0, y)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+    if x2 <= x or y2 <= y: return
+    cv2.addWeighted(overlay[y:y2, x:x2], alpha,
+                    frame[y:y2, x:x2], 1 - alpha, 0, frame[y:y2, x:x2])
+ 
+def rounded_rect(img, x, y, w, h, r, color):
+    r = int(min(r, w // 2, h // 2))
+    cv2.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
+    cv2.rectangle(img, (x, y + r), (x + w, y + h - r), color, -1)
+    for cxr, cyr in [(x + r, y + r), (x + w - r, y + r),
+                     (x + r, y + h - r), (x + w - r, y + h - r)]:
+        cv2.circle(img, (cxr, cyr), r, color, -1)
+ 
+def hub_radius(radius): return int(radius * 0.42)
+ 
+def draw_wheel(frame, cx, cy, radius, labels, active, colors, center_text="", triggered=False):
+    n = len(labels)
     step = 360.0 / n
-    ov   = frame.copy()
-
+    inner = hub_radius(radius)
+    bbox = (cx - radius, cy - radius, 2 * radius, 2 * radius)
+ 
+    ov = frame.copy()
     for i in range(n):
-        start_deg = i * step - 90
-        end_deg   = start_deg + step
-        bc  = colors[i]
+        s = i * step - 90
+        e = s + step
+        base = colors[i]
         if i == active:
-            col = tuple(min(c + 140, 255) for c in bc) if triggered else tuple(min(c + 90, 255) for c in bc)
+            col = tuple(min(int(v + 95), 255) for v in base) if triggered else base
         else:
-            col = bc
+            col = tuple(int(v * 0.32 + 20) for v in base)
         pts = [(cx, cy)]
-        for a in np.linspace(np.radians(start_deg), np.radians(end_deg), 30):
-            pts.append((int(cx + radius * np.cos(a)),
-                        int(cy + radius * np.sin(a))))
-        pts = np.array(pts, np.int32)
-        cv2.fillPoly(ov, [pts], col)
-        cv2.polylines(ov, [pts], True, (200, 200, 220), 1)
-
-    cv2.addWeighted(ov, 0.60, frame, 0.40, 0, frame)
-    cv2.circle(frame, (cx, cy), radius, (210, 215, 230), 2)
-
-    inner = radius // 3
-    cv2.circle(frame, (cx, cy), inner, (10, 12, 22), -1)
-    cv2.circle(frame, (cx, cy), inner, (90, 95, 120), 2)
-
+        for a in np.linspace(np.radians(s), np.radians(e), 28):
+            pts.append((int(cx + radius * np.cos(a)), int(cy + radius * np.sin(a))))
+        cv2.fillPoly(ov, [np.array(pts, np.int32)], col)
+    _blend(frame, ov, 0.42, bbox)
+ 
+    for i in range(n):
+        a = np.radians(i * step - 90)
+        cv2.line(frame, (cx, cy), (int(cx + radius * np.cos(a)), int(cy + radius * np.sin(a))), (150, 155, 180), 1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), radius, (222, 226, 240), 2, cv2.LINE_AA)
+ 
+    hov = frame.copy()
+    cv2.circle(hov, (cx, cy), inner, (14, 16, 26), -1)
+    _blend(frame, hov, 0.82, (cx - inner, cy - inner, 2 * inner, 2 * inner))
+    cv2.circle(frame, (cx, cy), inner, (92, 98, 124), 2, cv2.LINE_AA)
+ 
     for i in range(n):
         mid = np.radians(i * step - 90 + step / 2)
-        lx  = int(cx + radius * 0.65 * np.cos(mid))
-        ly  = int(cy + radius * 0.65 * np.sin(mid))
-        txt = labels[i]
-        sc  = 0.65 if i == active else 0.50
-        th  = 2    if i == active else 1
-        col = (255, 255, 255) if i == active else (200, 200, 210)
-        tw, t_h = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, sc, th)[0]
-        cv2.putText(frame, txt, (lx - tw // 2, ly + t_h // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, sc, col, th, cv2.LINE_AA)
-
-    if active >= 0:
-        mid = np.radians(active * step - 90 + step / 2)
-        px  = int(cx + (inner + 16) * np.cos(mid))
-        py  = int(cy + (inner + 16) * np.sin(mid))
-        cv2.circle(frame, (px, py), 9,  (0, 230, 255), -1)
-        cv2.circle(frame, (px, py), 9,  (255, 255, 255), 1)
-
+        lx  = cx + radius * 0.70 * np.cos(mid)
+        ly  = cy + radius * 0.70 * np.sin(mid)
+        is_a = (i == active)
+        queue_text(lx, ly, labels[i], 27 if is_a else 22, (255, 255, 255) if is_a else (205, 208, 220), anchor="mm", shadow=True)
+ 
+    if center_text: queue_text(cx, cy, center_text, 46, (236, 239, 250), anchor="mm")
+ 
+def draw_hud(frame, rows, fw):
+    fs, line_h, padx, pady, gap = 19, 30, 18, 16, 18
+    label_w = max(text_w(k, fs) for k, _ in rows)
+    val_w   = max(text_w(v, fs) for _, v in rows)
+    w = int(max(padx * 2 + label_w + gap + val_w, 200))
+    h = pady * 2 + line_h * len(rows)
+    x, y = fw - w - 18, 16
+    ov = frame.copy()
+    rounded_rect(ov, x, y, w, h, 12, (16, 18, 30))
+    _blend(frame, ov, 0.62, (x, y, w, h))
+    for i, (k, v) in enumerate(rows):
+        ty = y + pady + line_h // 2 + line_h * i
+        queue_text(x + padx, ty, k, fs, (150, 156, 180), anchor="lm")
+        queue_text(x + padx + label_w + gap, ty, v, fs, (95, 212, 236), anchor="lm")
+ 
+def draw_bottom_bar(frame, segments, fw, fh):
+    fs, gap = 22, 36
+    widths = [(text_w(k + " ", fs), text_w(v, fs)) for k, v in segments]
+    total  = sum(wk + wv for wk, wv in widths) + gap * (len(segments) - 1)
+    padx, bh = 30, 50
+    bw = int(total + padx * 2)
+    x  = (fw - bw) // 2
+    y  = fh - bh - 18
+    ov = frame.copy()
+    rounded_rect(ov, x, y, bw, bh, 20, (16, 18, 30))
+    _blend(frame, ov, 0.60, (x, y, bw, bh))
+ 
+    cy = y + bh // 2
+    tx = x + padx
+    for idx, (k, v) in enumerate(segments):
+        wk, wv = widths[idx]
+        queue_text(tx, cy, k + " ", fs, (150, 156, 180), anchor="lm"); tx += wk
+        queue_text(tx, cy, v, fs, (95, 212, 236), anchor="lm");        tx += wv
+        if idx < len(segments) - 1:
+            cv2.circle(frame, (int(tx + gap // 2), cy), 2, (115, 120, 145), -1, cv2.LINE_AA)
+            tx += gap
+ 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("Starting Air Piano...")
-    print("Point right hand finger at chord slice to play")
-    print("Move to a new slice to play again")
-    print("Left hand selects effect")
-    print("Hand height = octave")
-
-    missing = [f"{n}_oct{o}.wav" for n in NOTE_NAMES for o in [3, 4, 5]
-               if not os.path.exists(wav_path(n, o))]
-    if missing:
-        print(f"WARNING: {len(missing)} samples missing — run generate_samples.py first")
-    else:
-        print("All 21 samples found.")
-
     connect_to_processing()
-
+ 
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.6)
+ 
     cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    if not cap.isOpened():
-        print("ERROR: No camera found.")
-        return
-
-    for _ in range(5):
+    if not cap.isOpened(): cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened(): return print("ERROR: No camera found.")
+ 
+    print("Warming up camera...")
+    for _ in range(10):
         cap.read()
-
+        time.sleep(0.05)
+        
     ret, frame = cap.read()
-    if not ret:
-        print("ERROR: Cannot read camera frames.")
-        return
-
+    if not ret: return print("ERROR: Cannot read camera frames.")
+ 
     fh, fw = frame.shape[:2]
-    print(f"Camera: {fw}x{fh}. Press Q to quit.")
-
     cv2.namedWindow("Air Piano", cv2.WINDOW_NORMAL)
     cv2.setWindowProperty("Air Piano", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-    WHEEL_R = int(min(fw, fh) * 0.22)
-    LC = (int(fw * 0.13), fh // 2)
-    RC = (int(fw * 0.87), fh // 2)
-
-    chord_slice   = 0
-    effect_slice  = 0
-    octave        = 4
-    gesture       = "major"
-    right_present = False
-    left_present  = False
-    right_trigger = False
-    flash_frames  = 0
-
+ 
+    WHEEL_R = int(min(fw, fh) * 0.27)     
+    HUB_R   = hub_radius(WHEEL_R)
+    LC = (int(fw * 0.27), fh // 2)        
+    RC = (int(fw * 0.73), fh // 2)        
+ 
+    note_slice = 0
+    quality_slice = 0
+    octave = 4
+    last_note_slice = -1
+    flash_frames = 0
     startup_time = time.time()
-
-    while True:
+    last_play_time = 0      
+ 
+ 
+    while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            print("Camera lost.")
-            break
-
+        if not ret: break
+ 
         frame = cv2.flip(frame, 1)
         fh_r, fw_r = frame.shape[:2]
-
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
-
-        right_present = False
-        left_present  = False
-        right_trigger = False
-
+ 
+        note_present = qual_present = note_trigger = note_off = False
+ 
         if result.multi_hand_landmarks:
             for hand_lm in result.multi_hand_landmarks:
                 lm  = hand_lm.landmark
-                wx  = lm[0].x
-                wy  = lm[0].y
-                ang = index_angle(lm, fw_r, fh_r)
+                wx, wy = lm[0].x, lm[0].y
                 tip = (int(lm[8].x * fw_r), int(lm[8].y * fh_r))
-
+ 
                 if wx < 0.5:
-                    # Left half → effects wheel + major/minor control
-                    left_present = True
-                    effect_slice = angle_to_slice(ang, len(EFFECTS))
-                    gesture      = detect_gesture(lm)
-                    cv2.line(frame, LC, tip, (255, 220, 80), 2)
-                    cv2.circle(frame, tip, 11, (255, 220, 80), -1)
+                    note_present = True
+                    octave = get_octave(wy)
+                    dist = math.hypot(tip[0] - LC[0], tip[1] - LC[1])
+                    if dist < HUB_R:
+                        note_off = True                       
+                    else:
+                        ang = angle_around(*LC, *tip)
+                        # Applied the visual offset math fix here!
+                        note_slice = angle_to_slice(ang, len(NOTE_NAMES), NOTE_OFFSET)
+                        if note_slice != last_note_slice:
+                            note_trigger = True
+                            last_note_slice = note_slice
+                    cv2.line(frame, LC, tip, (90, 200, 230), 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 10, (90, 200, 230), -1, cv2.LINE_AA)
                 else:
-                    # Right half → chord wheel (no gesture detection here)
-                    right_present = True
-                    chord_slice   = angle_to_slice(ang, len(NOTE_NAMES))
-                    octave        = get_octave(wy)
-                    # Fire once when entering a new slice
-                    if should_trigger(chord_slice):
-                        right_trigger = True
-                    cv2.line(frame, RC, tip, (80, 220, 255), 2)
-                    cv2.circle(frame, tip, 11, (80, 220, 255), -1)
-
-        cur_note   = NOTE_NAMES[chord_slice]
-        cur_effect = EFFECTS[effect_slice]
-
-        if right_trigger and time.time() - startup_time > 2.0:
-            play_note(cur_note, octave, cur_effect)
-            flash_frames = 8
-            print(f"  ♪  {cur_note} {gesture} | Oct {octave} | {cur_effect}")
-
-        # Draw wheels
-        draw_wheel(frame, *LC, WHEEL_R, EFFECTS,    effect_slice, EFFECT_COLORS)
-        draw_wheel(frame, *RC, WHEEL_R, NOTE_NAMES, chord_slice,  CHORD_COLORS,
+                    qual_present = True
+                    dist = math.hypot(tip[0] - RC[0], tip[1] - RC[1])
+                    if dist >= HUB_R:
+                        ang = angle_around(*RC, *tip)
+                        # Applied the visual offset math fix here!
+                        quality_slice = angle_to_slice(ang, len(QUALITIES), QUAL_OFFSET)
+                    cv2.line(frame, RC, tip, (190, 130, 230), 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 10, (190, 130, 230), -1, cv2.LINE_AA)
+ 
+        if note_off or not note_present:
+            last_note_slice = -1
+ 
+        cur_note    = NOTE_NAMES[note_slice]
+        cur_quality = QUALITIES[quality_slice]
+        disp_q      = QUALITY_LABELS[cur_quality]
+        full_chord  = chord_name(cur_note, cur_quality)
+        note_active = note_present and not note_off
+ 
+        if note_trigger and time.time() - startup_time > 2.0:
+            if time.time() - last_play_time > 0.4: 
+                play_chord(cur_note, cur_quality, octave)
+                flash_frames = 8
+                last_play_time = time.time()
+                print(f"  ♪  {full_chord} | Oct {octave}")
+ 
+        draw_wheel(frame, *LC, WHEEL_R, NOTE_NAMES, note_slice, NOTE_COLORS,
+                   center_text=(cur_note if note_active else "OFF"),
                    triggered=(flash_frames > 0))
-
-        if flash_frames > 0:
-            flash_frames -= 1
-
-        # Labels
-        cv2.putText(frame, "EFFECTS",
-                    (LC[0] - 48, LC[1] - WHEEL_R - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 220, 80), 2, cv2.LINE_AA)
-        cv2.putText(frame, "CHORDS",
-                    (RC[0] - 42, RC[1] - WHEEL_R - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 220, 255), 2, cv2.LINE_AA)
-
-        # Octave indicator
-        oct_str = {5: "OCT 5  HIGH", 4: "OCT 4  MID", 3: "OCT 3  LOW"}[octave]
-        cv2.putText(frame, oct_str, (fw_r // 2 - 80, 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 255), 2, cv2.LINE_AA)
-
-        # Status bar
-        status = f"{cur_note} {gesture.upper()}  |  {cur_effect}  |  Oct {octave}"
-        cv2.rectangle(frame, (0, fh_r - 36), (fw_r, fh_r), (8, 10, 18), -1)
-        cv2.putText(frame, status, (fw_r // 2 - 180, fh_r - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (200, 210, 255), 1, cv2.LINE_AA)
-
+        draw_wheel(frame, *RC, WHEEL_R, [QUALITY_LABELS[q] for q in QUALITIES],
+                   quality_slice, QUALITY_COLORS, center_text=disp_q)
+ 
+        if flash_frames > 0: flash_frames -= 1
+ 
+        hands_n = int(note_present) + int(qual_present)
+        draw_hud(frame, [
+            ("Note",   cur_note if note_active else "—"),
+            ("Type",   disp_q),
+            ("Chord",  full_chord),
+            ("Octave", str(octave)),
+            ("Hands",  str(hands_n)),
+        ], fw_r)
+        draw_bottom_bar(frame, [
+            ("Mode",   "Two-hand Chord"),
+            ("Chord",  full_chord),
+            ("Octave", str(octave)),
+        ], fw_r, fh_r)
+ 
         send_state({
-            "chord":      f"{cur_note}_{gesture}",
-            "effect":     cur_effect,
+            "chord":      f"{cur_note}_{cur_quality}",
+            "quality":    cur_quality,
             "octave":     octave,
-            "gesture":    gesture,
-            "right_hand": right_present,
-            "left_hand":  left_present,
+            "gesture":    "minor" if is_minor_quality(cur_quality) else "major",
+            "right_hand": qual_present,
+            "left_hand":  note_present,
         })
-
+ 
+        frame = flush_text(frame)
         cv2.imshow("Air Piano", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+ 
     cap.release()
     cv2.destroyAllWindows()
-    if tcp_sock:
-        tcp_sock.close()
-    print("Bye.")
-
+    if tcp_sock: tcp_sock.close()
+ 
 if __name__ == "__main__":
     main()
