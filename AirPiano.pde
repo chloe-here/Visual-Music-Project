@@ -2,10 +2,6 @@
 // Processing info panel — receives JSON state from Python via TCP
 // Run this BEFORE running air_piano.py
 
-// AirPiano.pde
-// Processing info panel — receives JSON state from Python via TCP
-// Run this BEFORE running air_piano.py
-
 import processing.net.*;
 
 Server server;
@@ -42,10 +38,10 @@ void setup() {
   frameRate(30);
   textAlign(CENTER, CENTER);
   server = new Server(this, 5204);
-  println("Processing TCP server listening on port 5204");
+  println("Processing TCP server listening on port 5204"); //message displayed when connection is open and python can be run
 }
 
-void draw() {
+void draw() { //UI for info panel
   readTCP();
   background(BG);
   drawHeader();
@@ -55,7 +51,8 @@ void draw() {
   drawHandBox();
   drawHints();
 
-  if (flashTimer > 0) {
+  // brief yellow flash across screen when a new note fires
+  if (flashTimer > 0) { 
     noStroke();
     fill(YELLOW, map(flashTimer, 0, FLASH_DUR, 0, 50));
     rect(0, 0, width, height);
@@ -63,6 +60,7 @@ void draw() {
   }
 }
 
+// reads incoming JSON data sent from Python over TCP
 void readTCP() {
   Client c = server.available();
   if (c == null) return;
@@ -77,6 +75,7 @@ void readTCP() {
   }
 }
 
+// extracts chord, quality, octave and hand state from each JSON message
 void parseMsg(String msg) {
   try {
     // Check if the message is actually a JSON object
@@ -104,14 +103,14 @@ void parseMsg(String msg) {
   }
 }
 
-void drawHeader() {
+void drawHeader() { //displays "AIR PIANO" header
   fill(YELLOW); textSize(24);
   text("AIR PIANO", width/2, 28);
   fill(MUTED); textSize(11);
   text("live info panel", width/2, 48);
 }
 
-void drawChordBox() {
+void drawChordBox() { //shows current chord in colored text indicating whether it's major or minor
   box(14, 60, width-28, 105);
   label("CHORD", width/2, 77);
   fill(gesture.equals("minor") ? MINOR_C : MAJOR_C);
@@ -119,14 +118,14 @@ void drawChordBox() {
   text(chord, width/2, 128);
 }
 
-void drawQualityBox() {
+void drawQualityBox() { // shows major or minor
   box(14, 175, width-28, 68);
   label("CHORD TYPE", width/2, 192);
   fill(CYAN); textSize(26);
   text(quality.toUpperCase(), width/2, 224);
 }
 
-void drawOctaveBox() {
+void drawOctaveBox() { //shows which octave is active
   box(14, 253, width-28, 80);
   label("OCTAVE", width/2, 270);
   int[]    octs  = {5, 4, 3};
@@ -143,7 +142,7 @@ void drawOctaveBox() {
   }
 }
 
-void drawHandBox() {
+void drawHandBox() { // shows which hands are detected
   box(14, 343, width-28, 80);
   label("HANDS", width/2, 360);
 
@@ -170,7 +169,8 @@ void drawHandBox() {
   text(quality.toUpperCase(), width/2, 390);
 }
 
-void drawHints() {
+// hint text shown at bottom of panel for the user
+void drawHints() { 
   fill(MUTED); textSize(10);
   text("Left wheel = note  |  Right wheel = chord type", width/2, 448);
   text("Point a finger to select a slice", width/2, 462);
